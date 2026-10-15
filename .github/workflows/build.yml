@@ -103,10 +103,16 @@ jobs:
           go-version-file: src/go.mod
           cache-dependency-path: src/go.sum
 
+      - name: Install libvips (cgo dependency of the tested packages)
+        if: steps.upstream.outputs.skip != 'true'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libvips-dev
+
       - name: Verify patched behaviour
         if: steps.upstream.outputs.skip != 'true'
         working-directory: src
-        run: go test ./internal/imagesize/ -run 'TestHQPatch' -count=1 -v
+        run: |
+          go test -count=1 -v -run '^TestHQPatch' \
+            ./internal/imagesize/ ./internal/catalog/ ./internal/api/handlers/
 
       - name: Set up Docker Buildx
         if: steps.upstream.outputs.skip != 'true'
