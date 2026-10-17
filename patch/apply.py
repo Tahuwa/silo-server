@@ -9,16 +9,17 @@ non-zero instead of producing an image that is silently unpatched.
 
 What changes (see README.md for the reasoning):
   - WebP quality 90 -> 95 for every cached artwork variant
-  - cached "original" longest edge 1920 -> 3000 px
-  - poster/still ladder gains a 1280 px rung ("large": tvOS, Infuse)
-  - LadderVersion + 100 so Silo backfills the new rung for existing artwork
+  - cached "original" longest edge at least 3000 px (upstream: 3840 since v3)
+  - poster/still ladders gain 1280 px ("large": tvOS, Infuse) and 780 px (the
+    served size below; upstream dropped it in ladder v3) rungs
+  - LadderVersion + 100 so Silo backfills the new rungs for existing artwork
   - poster/still sizes served to apps, in every path Silo picks them:
       * explicit image_size=small / medium     300 / 500 -> 780
       * no image_size (web UI, most endpoints) 500       -> 780
       * hard-coded card / featured paths       300 / 500 -> 780
     and backdrop cards (small / hard-coded card path) 300 -> 1280.
-    780 and 1280 are rungs every cached poster / backdrop already has, so
-    none of this waits on the ladder backfill.
+    Artwork cached before ladder v3 already has w780 posters / stills and
+    w1280 backdrops, so none of this waits on the ladder backfill.
 """
 from __future__ import annotations
 
@@ -70,38 +71,55 @@ def patch(root: Path) -> None:
             raise PatchError(f"{f.relative_to(root)} is already patched")
 
     # ── Encoding ─────────────────────────────────────────────────────────────
+    # Floors, not fixed values: upstream raising one past ours must not be
+    # undone (ladder v3 raised the original cap to 3840).
+    def at_least(floor: int, what: str):
+        def repl(m: re.Match) -> str:
+            upstream = int(m.group(2))
+            if upstream >= floor:
+                print(f"  --  {what}: upstream already {upstream}, kept")
+                return m.group(0)
+            return f"{m.group(1)}{floor} // {MARK}: upstream {upstream}"
+        return repl
+
     sub_once(
         imageutil,
-        r"(\bwebpQuality\s*=\s*)\d+",
-        rf"\g<1>{WEBP_QUALITY} // {MARK}",
-        f"WebP quality -> {WEBP_QUALITY}",
+        r"(\bwebpQuality\s*=\s*)(\d+)",
+        at_least(WEBP_QUALITY, "WebP quality"),
+        f"WebP quality >= {WEBP_QUALITY}",
     )
     sub_once(
         imageutil,
-        r"(\bconst MaxCachedOriginalDimension\s*=\s*)\d+",
-        rf"\g<1>{MAX_ORIGINAL_DIMENSION} // {MARK}",
-        f"original cap -> {MAX_ORIGINAL_DIMENSION}px",
+        r"(\bconst MaxCachedOriginalDimension\s*=\s*)(\d+)",
+        at_least(MAX_ORIGINAL_DIMENSION, "original cap"),
+        f"original cap >= {MAX_ORIGINAL_DIMENSION}px",
     )
 
     # ── Ladder ───────────────────────────────────────────────────────────────
-    def add_rung(m: re.Match) -> str:
+    # Rungs are only ever added, never removed: upstream's backfill and its
+    # database fence check for upstream's own rungs (poster w1000, still
+    # w1280), so the patched ladder must stay a superset of upstream's.
+    def ladder_re(label: str) -> str:
+        # The case label, any comment lines under it, then the return literal.
+        return rf"({label}[^\n]*\n(?:\s*//[^\n]*\n)*\s*return \[\]int\{{)([^}}]*)\}}"
+
+    def add_rungs(m: re.Match) -> str:
         widths = [int(w) for w in re.findall(r"\d+", m.group(2))]
         if not widths:
-            raise PatchError("poster/still ladder is empty")
-        if POSTER_TOP_RUNG not in widths:
-            widths.append(POSTER_TOP_RUNG)
-        if POSTER_SERVED_WIDTH not in widths:
-            # Every size we serve must name a rung that exists, or posters 404.
-            raise PatchError(f"poster/still ladder {widths} has no {POSTER_SERVED_WIDTH} rung")
-        widths.sort(reverse=True)
+            raise PatchError("ladder is empty")
+        # Every size we serve must name a rung that exists, or posters 404.
+        widths = sorted(set(widths) | {POSTER_TOP_RUNG, POSTER_SERVED_WIDTH}, reverse=True)
         return f"{m.group(1)}{', '.join(map(str, widths))}}} // {MARK}"
 
-    sub_once(
-        artworkkey,
-        r"(default:\s*//\s*poster, still\s*\n\s*return \[\]int\{)([^}]*)\}",
-        add_rung,
-        f"poster/still ladder += {POSTER_TOP_RUNG}",
-    )
+    rungs = f"{POSTER_TOP_RUNG}, {POSTER_SERVED_WIDTH}"
+    sub_once(artworkkey, ladder_re(r"default:\s*//\s*poster\b"), add_rungs,
+             f"poster ladder += {rungs}")
+    text = artworkkey.read_text(encoding="utf-8")
+    if re.search(r"\bcase ImageStill:", text):
+        sub_once(artworkkey, ladder_re(r"\bcase ImageStill:"), add_rungs,
+                 f"still ladder += {rungs}")
+    elif not re.search(r"default:\s*//[^\n]*\bstill\b", text):
+        raise PatchError("still ladder not found: no case ImageStill, and the poster default no longer covers still")
     sub_once(
         artworkkey,
         r"(\bconst LadderVersion\s*=\s*)(\d+)",
@@ -109,9 +127,8 @@ def patch(root: Path) -> None:
         f"LadderVersion + {LADDER_VERSION_OFFSET}",
     )
     # The backdrop card size must exist in the backdrop ladder.
-    backdrop = re.search(r"case ImageBackdrop:\s*\n\s*return \[\]int\{([^}]*)\}",
-                         artworkkey.read_text(encoding="utf-8"))
-    if not backdrop or str(BACKDROP_CARD_WIDTH) not in re.findall(r"\d+", backdrop.group(1)):
+    backdrop = re.search(ladder_re(r"\bcase ImageBackdrop:"), artworkkey.read_text(encoding="utf-8"))
+    if not backdrop or str(BACKDROP_CARD_WIDTH) not in re.findall(r"\d+", backdrop.group(2)):
         raise PatchError(f"backdrop ladder has no {BACKDROP_CARD_WIDTH} rung")
 
     # ── Served sizes: explicit image_size (apps, Jellyfin-mode cards) ────────
@@ -171,13 +188,13 @@ func hqVariant(imageType string, size Size) (string, bool) {{
 
 // {MARK}: sharper artwork for requests that name no image_size.
 
-import "github.com/Silo-Server/silo-server/internal/imagesize"
+import "strings"
 
 // hqLegacyVariant overrides cachedImageVariantKey's historical defaults for
 // size-less requests: posters and stills get the {POSTER_SERVED_WIDTH} px rung instead of
-// 500. Explicit sizes are left to imagesize.Variant.
+// 500. Explicit sizes and widths ("width:N") are left to imagesize.Variant.
 func hqLegacyVariant(imageType, size string) (string, bool) {{
-\tif parsed, err := imagesize.Parse(size); err == nil && parsed != imagesize.Unset {{
+\tif strings.TrimSpace(size) != "" {{
 \t\treturn "", false
 \t}}
 \tswitch imageType {{
@@ -261,6 +278,9 @@ func TestHQPatch(t *testing.T) {{
 \t\t{{"logo", Medium, "w500"}},
 \t\t{{"profile", Small, "w300"}},
 \t\t{{"profile", Medium, "w500"}},
+\t\t// Explicit widths still pick the narrowest rung that covers them.
+\t\t{{"poster", Width(600), "w{POSTER_SERVED_WIDTH}"}},
+\t\t{{"poster", Width(1100), "w{POSTER_TOP_RUNG}"}},
 \t}}
 \tfor _, c := range cases {{
 \t\tif got := Variant(c.imageType, c.size); got != c.want {{
@@ -293,6 +313,7 @@ func TestHQPatchLegacyDefaults(t *testing.T) {{
 \t\t{{"backdrop", "", "w1920"}},
 \t\t{{"backdrop", "small", "w{BACKDROP_CARD_WIDTH}"}},
 \t\t{{"logo", "", "w500"}},
+\t\t{{"poster", "width:1100", "w{POSTER_TOP_RUNG}"}},
 \t}}
 \tfor _, c := range cases {{
 \t\tif got := cachedImageVariantKey(c.imageType, c.size); got != c.want {{

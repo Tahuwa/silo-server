@@ -19,16 +19,21 @@ Apart from the five changes below, the image is upstream Silo.
 Silo re-encodes every piece of artwork when it caches it, and apps are served
 renditions smaller than many screens need:
 
-| | Upstream | This image |
+| | Upstream (ladder v3) | This image |
 |---|---|---|
 | WebP quality of every cached variant | 90 | **95** |
-| Longest edge of the cached "original" | 1920 px | **3000 px** |
-| Poster / episode-still sizes generated | 780 · 500 · 300 | **1280** · 780 · 500 · 300 |
+| Longest edge of the cached "original" | 3840 px | 3840 px (patch only raises it below 3000) |
+| Poster sizes generated | 1000 · 500 · 300 | **1280** · 1000 · **780** · 500 · 300 |
+| Episode-still sizes generated | 1280 · 500 · 300 | 1280 · **780** · 500 · 300 |
 | Poster / still served for cards (`small`) | 300 px | **780 px** |
 | Poster / still served for default and `medium` | 500 px | **780 px** |
-| Poster / still served for `large` | 780 px | **1280 px** |
+| Poster served for `large` | 1000 px | **1280 px** |
 | Backdrop served for landscape cards (`small`) | 300 px | **1280 px** |
 | `artworkkey.LadderVersion` | N | N + 100 |
+
+The patch only ever adds rungs to upstream's ladder. Upstream's backfill and
+database fence check for upstream's own rungs, so dropping one would make the
+backfill reopen on every newly cached image.
 
 Silo picks a served size in three places, and all three are patched:
 
@@ -43,21 +48,25 @@ Effects:
 - **Library grids and shelves** (web, apps, Infuse) show 780 px posters and title cards
   instead of 300 px, and 1280 px landscape cards instead of 300 px.
 - **Detail pages and default-size requests** get 780 px instead of 500 px.
-- **Apple TV** asks for "large" and gets 1280 px posters and stills instead of 780 px.
-- Logos, headshots and banners keep their upstream sizes. Only the quality and
-  original-size changes apply to them.
-- The 780 px and 1280 px files these sizes use already exist for all cached
-  posters and backdrops, so the sharper cards apply immediately, without
-  re-caching.
-- Only "large" posters use the new 1280 px poster rung. Raising `LadderVersion`
-  makes Silo's one-shot ladder backfill generate that rung for artwork it has
-  already cached. Until then, those requests fall back to 780 px.
+- **Apple TV** asks for "large" and gets 1280 px posters instead of 1000 px.
+- Logos, headshots and banners keep their upstream sizes. Only the quality
+  change applies to them.
+- Upstream dropped the 780 px poster / still rung in ladder v3. The patch keeps
+  it, so artwork cached before v3 already has the card size and it isn't
+  garbage-collected.
+- Raising `LadderVersion` makes Silo's one-shot ladder backfill generate the
+  rungs that cached artwork is missing. Until then, requests for them fall back
+  to the widest rung that artwork has.
+- Clients that send explicit widths (`/api/v2` `poster_width` and the other
+  slot widths, Jellyfin `MaxWidth`) are left to upstream. They pick the
+  narrowest rung that covers the width, and the extra rungs make that pick
+  tighter.
 
 Grids download more data: a 780 px WebP poster is roughly 3–5× the bytes of a
 300 px one. That's fine on a home network, but it's noticeable on slow remote
 connections.
 
-Artwork that is already cached keeps its quality-90, 1920 px-capped files.
+Artwork that is already cached keeps its quality-90 files.
 Re-apply custom posters from their source to get the higher-quality encode.
 
 ## Use it
